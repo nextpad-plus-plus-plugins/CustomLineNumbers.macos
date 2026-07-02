@@ -45,10 +45,11 @@ you want *only* the custom numbers visible, turn off the host's line numbers in
 ### Known limitation: status bar
 
 The Windows plugin also reformats the line/column readout in the status bar.
-On macOS the host's `NPPM_SETSTATUSBAR` message is a no-op (declared but not
-implemented), so the **status-bar readout cannot be reformatted** by a plugin.
-That part of the original feature is therefore not available here. The column-
-number-offset setting is likewise inert (it only ever affected the status bar).
+On macOS the host owns and continuously rewrites that readout, so a plugin
+**cannot reformat it** (`NPPM_SETSTATUSBAR`, where a host implements it, targets a
+dedicated plugin status field — not the line/column readout). That part of the
+original feature is therefore not available here. The column-number-offset
+setting is likewise inert (it only ever affected the status bar).
 
 > One-line restore if a future host version exposes margin-0 formatting: in
 > `src/CustomLineNumbers.mm`, point `kCLNMargin` at `0` and remove the

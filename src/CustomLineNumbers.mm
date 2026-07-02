@@ -37,9 +37,10 @@
 // EXTRA margin to the right of the host's decimal margin 0; we SUPPLEMENT, not
 // replace, the host's line numbers. The host's decimal margin can be turned off
 // by the user (Prefs ▸ show line numbers) to leave only ours visible.  And
-// NPPM_SETSTATUSBAR is a host no-op (NppPluginInterfaceMac.h:139, unhandled), so
-// the status-bar line/column readout part of the Windows plugin CANNOT be
-// overridden here — that piece is dropped. Both limitations are host-capability
+// The host owns and continuously rewrites the status-bar line/column readout, so a
+// plugin cannot reformat it (NPPM_SETSTATUSBAR, where a host implements it, targets
+// a dedicated plugin status field — not the line/column readout). So the status-bar
+// part of the Windows plugin is dropped. Both limitations are host-capability
 // gaps; no host change is made or needed. One-line restore if the host ever
 // exposes margin-0 formatting: point kCLNMargin at 0 and stop calling
 // SCI_SETMARGINS (see kCLNMargin below).
@@ -59,7 +60,7 @@
 
 // ── constants ────────────────────────────────────────────────────────────────
 static const char *PLUGIN_NAME = "CustomLineNumbers";
-static const int   nbFunc      = 6;
+static const int   nbFunc      = 8;   // 6 commands + 2 separators (empty-name slots)
 
 // Our own, plugin-owned margin (host occupies 0-4 and never raises the count).
 // RESTORE NOTE: if a future host exposes margin-0 formatting, set this to 0 and
@@ -71,11 +72,13 @@ static const int  kCLNMarginStyle = STYLE_MAX;        // 255
 static const int  kCLNMarginWidthMin = 36;            // px floor like host's 30
 
 // Display modes (mirror the Windows feature set: hex / relative / off).
-enum CLNMode { kModeOff = 0, kModeHex = 1, kModeRelative = 2 };
+enum CLNMode { kModeOff = 0, kModeHex = 1, kModeRelative = 2, kModeDecimal = 3 };
 
 // Menu item indices.
 enum {
-    IDX_OFF = 0, IDX_HEX = 1, IDX_REL = 2, IDX_SETTINGS = 3, IDX_ABOUT = 4, IDX_HOME = 5
+    IDX_OFF = 0, IDX_HEX = 1, IDX_REL = 2, IDX_DEC = 3, IDX_SEP1 = 4, IDX_SETTINGS = 5,
+    IDX_SEP2 = 6, IDX_ABOUT = 7
+    // IDX_SEP1 / IDX_SEP2 are left empty-name by memset → rendered as separators.
 };
 
 // ── plugin-wide state ────────────────────────────────────────────────────────
@@ -94,10 +97,6 @@ struct CLNSettings {
     bool    bold         = false;
 };
 static CLNSettings g_set;
-
-// Per-view bookkeeping of how many lines we last styled, so we can clear stale
-// margin text when a document shrinks (mirrors the Windows catalog intent).
-static std::map<NppHandle, long> g_lastStyledLines;
 
 // ── platform helpers ─────────────────────────────────────────────────────────
 static intptr_t sci(NppHandle h, uint32_t msg, uintptr_t w = 0, intptr_t l = 0) {
@@ -175,12 +174,13 @@ static void loadSettings() {
         // relativeNumbers/hexNumbers/enabled trio for settings-file compatibility.
         if (kv.count("mode")) {
             long m = getInt("mode", kModeOff);
-            g_set.mode = (m == kModeHex || m == kModeRelative) ? (CLNMode)m : kModeOff;
+            g_set.mode = (m == kModeHex || m == kModeRelative || m == kModeDecimal) ? (CLNMode)m : kModeOff;
         } else {
             bool enabled = getBool("enabled", false);
             bool rel     = getBool("relativeNumbers", false);
             bool hex     = getBool("hexNumbers", false);
-            g_set.mode = !enabled ? kModeOff : rel ? kModeRelative : hex ? kModeHex : kModeOff;
+            // Windows "enabled + not hex + not relative" == custom decimal.
+            g_set.mode = !enabled ? kModeOff : rel ? kModeRelative : hex ? kModeHex : kModeDecimal;
         }
         g_set.lineOffset = (int)getInt("lineOffset", 0);
         g_set.colOffset  = (int)getInt("columnOffset", g_set.lineOffset);
@@ -247,7 +247,6 @@ static void clearMargin(NppHandle h) {
     if (!h) return;
     sci(h, SCI_MARGINTEXTCLEARALL);
     sci(h, SCI_SETMARGINWIDTHN, (uintptr_t)kCLNMargin, 0);
-    g_lastStyledLines.erase(h);
 }
 
 // Format one line's number string into buf.
@@ -259,7 +258,7 @@ static void formatNumber(char *buf, size_t n, long lineIdx, long caretLine) {
             snprintf(buf, n, "%ld", labs(lineIdx - caretLine));    // others: distance
     } else if (g_set.mode == kModeHex) {
         snprintf(buf, n, "%lx", (unsigned long)(lineIdx + g_set.lineOffset));
-    } else {
+    } else {   // kModeDecimal: base-10 line numbers with the custom start offset
         snprintf(buf, n, "%ld", lineIdx + g_set.lineOffset);
     }
 }
@@ -268,19 +267,30 @@ static void formatNumber(char *buf, size_t n, long lineIdx, long caretLine) {
 // the host's STYLE_LINENUMBER metric on the line count (parity with the host's
 // own recomputeLineNumberMargin).
 static void fitMarginWidth(NppHandle h, long lineCount, long caretLine) {
-    char widest[64];
-    // Worst-case width: in hex it's the top line number; in relative it's the
-    // larger of (distance to first line, distance to last line); else top line.
+    long top = lineCount > 0 ? lineCount - 1 : 0;
+    long w;
     if (g_set.mode == kModeRelative) {
-        long d = labs(lineCount - 1 - caretLine);
-        if (caretLine > d) d = caretLine;                 // distance up to line 0
-        snprintf(widest, sizeof(widest), "%ld", d);
+        // Caret-INDEPENDENT worst case so the width never jitters as the caret
+        // moves: the widest relative distance is `top`, and the current line always
+        // shows its absolute number (widest at either document end, with the offset
+        // applied — so a large lineOffset is never clipped). Measure each candidate
+        // and keep the widest.
+        long cand[3] = { top, top + g_set.lineOffset, (long)g_set.lineOffset };
+        w = kCLNMarginWidthMin;
+        char s[80];
+        for (long v : cand) {
+            snprintf(s, sizeof(s), "_%ld", v);            // pad like the host ("_")
+            long m = sci(h, SCI_TEXTWIDTH, kCLNMarginStyle, (intptr_t)s);
+            if (m > w) w = m;
+        }
     } else {
-        formatNumber(widest, sizeof(widest), lineCount > 0 ? lineCount - 1 : 0, caretLine);
+        // hex / off: widest is the top line number (offset-aware, caret-independent).
+        char widest[64];
+        formatNumber(widest, sizeof(widest), top, caretLine);
+        std::string measure = std::string("_") + widest; // pad like the host ("_")
+        w = sci(h, SCI_TEXTWIDTH, kCLNMarginStyle, (intptr_t)measure.c_str());
+        if (w < kCLNMarginWidthMin) w = kCLNMarginWidthMin;
     }
-    std::string measure = std::string("_") + widest;      // pad like the host ("_")
-    long w = sci(h, SCI_TEXTWIDTH, kCLNMarginStyle, (intptr_t)measure.c_str());
-    if (w < kCLNMarginWidthMin) w = kCLNMarginWidthMin;
     sci(h, SCI_SETMARGINWIDTHN, (uintptr_t)kCLNMargin, w);
 }
 
@@ -312,7 +322,6 @@ static void updateView(NppHandle h) {
         sci(h, SCI_MARGINSETSTYLE, (uintptr_t)i, kCLNMarginStyle);
         sci(h, SCI_MARGINSETTEXT,  (uintptr_t)i, (intptr_t)num);
     }
-    g_lastStyledLines[h] = lineCount;
 }
 
 static void updateAllViews() {
@@ -342,6 +351,8 @@ static void syncMenuChecks() {
                          (uintptr_t)funcItem[IDX_HEX]._cmdID, g_set.mode == kModeHex);
     nppData._sendMessage(nppData._nppHandle, NPPM_SETMENUITEMCHECK,
                          (uintptr_t)funcItem[IDX_REL]._cmdID, g_set.mode == kModeRelative);
+    nppData._sendMessage(nppData._nppHandle, NPPM_SETMENUITEMCHECK,
+                         (uintptr_t)funcItem[IDX_DEC]._cmdID, g_set.mode == kModeDecimal);
 }
 
 static void setMode(CLNMode m) {
@@ -355,13 +366,7 @@ static void setMode(CLNMode m) {
 static void cmdOff()      { setMode(kModeOff); }
 static void cmdHex()      { setMode(kModeHex); }
 static void cmdRelative() { setMode(kModeRelative); }
-
-static void visitHomepage() {
-    @autoreleasepool {
-        [[NSWorkspace sharedWorkspace] openURL:
-            [NSURL URLWithString:@"https://github.com/AndreasHeimDE/CustomLineNumbers"]];
-    }
-}
+static void cmdDecimal()  { setMode(kModeDecimal); }
 
 // ── About ─────────────────────────────────────────────────────────────────────
 static void showAbout() {
@@ -369,15 +374,13 @@ static void showAbout() {
         NSAlert *a = [[NSAlert alloc] init];
         a.messageText = @"CustomLineNumbers";
         a.informativeText =
-            @"Display line numbers in a custom format — hexadecimal or relative "
-            @"(Vim-style distance from the caret line) — in an extra editor margin.\n\n"
-            @"macOS port of the Notepad++ plugin by Andreas Heim (GPL v3).\n\n"
-            @"Note: shown in a plugin-owned margin alongside the host's decimal "
-            @"line-number margin (which you can hide in Preferences). The status-bar "
-            @"readout cannot be reformatted on macOS.";
+            @"Display line numbers in a custom format — hexadecimal, relative "
+            @"(Vim-style distance from the caret line), or decimal with a custom "
+            @"start — in an extra editor margin, with a configurable starting number.\n\n"
+            @"Original Notepad++ plugin by Andreas Heim (GPL v3). macOS port by "
+            @"Andrey Letov.";
         [a addButtonWithTitle:@"OK"];
-        [a addButtonWithTitle:@"Plugin homepage"];
-        if ([a runModal] == NSAlertSecondButtonReturn) visitHomepage();
+        [a runModal];
     }
 }
 
@@ -426,7 +429,7 @@ static long scintillaFromColor(NSColor *c) {
     CGFloat y = H - 48;
     [self label:@"Number format:" at:NSMakeRect(20, y, 120, 22) to:root];
     _modePopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, y - 2, 220, 26)];
-    [_modePopup addItemsWithTitles:@[@"Off (decimal — host default)", @"Hexadecimal", @"Relative (Vim-style)"]];
+    [_modePopup addItemsWithTitles:@[@"Off (decimal — host default)", @"Hexadecimal", @"Relative (Vim-style)", @"Decimal (custom start)"]];
     [_modePopup selectItemAtIndex:(NSInteger)g_set.mode];
     [root addSubview:_modePopup];
 
@@ -521,18 +524,18 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
     loadSettings();
 
     memset(funcItem, 0, sizeof(funcItem));
-    strncpy(funcItem[IDX_OFF]._itemName,      "Off (decimal)",  NPP_MENU_ITEM_SIZE - 1);
+    strncpy(funcItem[IDX_OFF]._itemName,      "Off (host numbers)", NPP_MENU_ITEM_SIZE - 1);
     funcItem[IDX_OFF]._pFunc      = cmdOff;
     strncpy(funcItem[IDX_HEX]._itemName,      "Hexadecimal",    NPP_MENU_ITEM_SIZE - 1);
     funcItem[IDX_HEX]._pFunc      = cmdHex;
     strncpy(funcItem[IDX_REL]._itemName,      "Relative",       NPP_MENU_ITEM_SIZE - 1);
     funcItem[IDX_REL]._pFunc      = cmdRelative;
+    strncpy(funcItem[IDX_DEC]._itemName,      "Decimal (custom start)", NPP_MENU_ITEM_SIZE - 1);
+    funcItem[IDX_DEC]._pFunc      = cmdDecimal;
     strncpy(funcItem[IDX_SETTINGS]._itemName, "Settings...",    NPP_MENU_ITEM_SIZE - 1);
     funcItem[IDX_SETTINGS]._pFunc = showSettings;
     strncpy(funcItem[IDX_ABOUT]._itemName,    "About",          NPP_MENU_ITEM_SIZE - 1);
     funcItem[IDX_ABOUT]._pFunc    = showAbout;
-    strncpy(funcItem[IDX_HOME]._itemName,     "Plugin homepage", NPP_MENU_ITEM_SIZE - 1);
-    funcItem[IDX_HOME]._pFunc     = visitHomepage;
     // No default shortcuts: host ignores FuncItem._pShKey, and Cmd-keys collide.
 }
 
@@ -573,15 +576,17 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
             // Repaint only when the line COUNT changed (insert/delete of lines),
             // mirroring CheckTextChanges (SCNotification.linesAdded ≠ 0).
             if (g_set.mode != kModeOff && n->linesAdded != 0)
-                updateView(currentScintilla());
+                updateAllViews();   // both views: a cloned split shows the edit in each
             break;
 
         case SCN_UPDATEUI:
             // Caret move / scroll. Needed for relative mode (numbers shift with the
-            // caret) and to fill the margin for newly-scrolled-in lines.
+            // caret) and to fill the margin for newly-scrolled-in lines. Repaint
+            // both views (each reads its own caret); the second handle is 0 when
+            // there is no split, so this is one repaint in the common case.
             if (g_set.mode != kModeOff &&
                 (n->updated & (SC_UPDATE_SELECTION | SC_UPDATE_V_SCROLL | SC_UPDATE_CONTENT)))
-                updateView(currentScintilla());
+                updateAllViews();
             break;
 
         case SCN_ZOOM:
