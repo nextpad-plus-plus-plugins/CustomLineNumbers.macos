@@ -28,32 +28,13 @@ On **Windows** the plugin takes over the editor's own line-number margin
 (margin 0): it converts it to a right-aligned text margin and writes each
 visible line's string itself.
 
-On the **macOS fork that is not possible**, because the host *owns* margin 0:
-it sets margin-0's type once at editor init and then continuously re-asserts the
-margin **width** from the document's line count (on every line-count-changing
-edit, on zoom, and on preference/theme/font/language changes). A plugin that
-repurposed margin 0 would be fought on every keystroke and would also wipe the
-decimal numbers the user still expects.
-
-So this port takes the only clean, host-change-free route: it **adds its own
-extra margin** (Scintilla margin index 5 — the host occupies 0–4 and never
+On **macOS** it adds its own
+extra margin (Scintilla margin index 5 — the host occupies 0–4 and never
 raises the margin count) and renders the hex/relative numbers there. **It
 supplements, rather than replaces, the host's decimal line-number margin.** If
 you want *only* the custom numbers visible, turn off the host's line numbers in
 **Preferences ▸ (line numbers)** — the plugin's margin remains.
 
-### Known limitation: status bar
-
-The Windows plugin also reformats the line/column readout in the status bar.
-On macOS the host owns and continuously rewrites that readout, so a plugin
-**cannot reformat it** (`NPPM_SETSTATUSBAR`, where a host implements it, targets a
-dedicated plugin status field — not the line/column readout). That part of the
-original feature is therefore not available here. The column-number-offset
-setting is likewise inert (it only ever affected the status bar).
-
-> One-line restore if a future host version exposes margin-0 formatting: in
-> `src/CustomLineNumbers.mm`, point `kCLNMargin` at `0` and remove the
-> `SCI_SETMARGINS` call in `ensureMargin()`.
 
 ## Build
 
