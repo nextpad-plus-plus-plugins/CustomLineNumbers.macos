@@ -245,6 +245,11 @@ static void ensureMargin(NppHandle h) {
 
 static void clearMargin(NppHandle h) {
     if (!h) return;
+    // Only touch margin 5 on editors where ensureMargin actually raised the
+    // count. On a virgin editor (count still at the host's 5) there is
+    // nothing of ours to clear — and blindly zero-widthing index 5 here
+    // (NPPN_READY with mode Off) interfered with other plugins' margins.
+    if (sci(h, SCI_GETMARGINS) <= kCLNMargin) return;
     sci(h, SCI_MARGINTEXTCLEARALL);
     sci(h, SCI_SETMARGINWIDTHN, (uintptr_t)kCLNMargin, 0);
 }
